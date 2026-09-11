@@ -18,7 +18,18 @@ from loxley.paper import Book
 from loxley.rules import AGENTS, screen
 from loxley.rpc import Rpc
 
-BLOCK_SECONDS = 2  # close enough to turn a block gap into an age
+def block_seconds(rpc: Rpc, head: int, sample: int = 5000) -> float:
+    """Measure the chain's block time instead of assuming it.
+
+    Robinhood Chain runs near a tenth of a second a block, so a hardcoded
+    guess of one or two seconds misreads a token's age by more than an order
+    of magnitude — and age is what the `listed too long ago` refusal turns on.
+    """
+    lo = max(1, head - sample)
+    first = int(rpc.block(lo)["timestamp"], 16)
+    last = int(rpc.block(head)["timestamp"], 16)
+    span = max(1, head - lo)
+    return max((last - first) / span, 1e-6)
 
 
 def main() -> None:
@@ -40,9 +51,12 @@ def main() -> None:
     head = rpc.block_number()
     book = Book.load(args.book)
     now = time.time()
+    secs_per_block = block_seconds(rpc, head)
 
     launches = recent_launches(rpc, blocks=args.blocks, head=head)
-    print(f"block {head:,} · {len(launches)} launches in the last {args.blocks:,} blocks")
+    window_min = args.blocks * secs_per_block / 60
+    print(f"block {head:,} · {len(launches)} launches in the last {args.blocks:,} blocks "
+          f"({window_min:,.1f} min at {secs_per_block:.3f}s/block)")
     print(f"screening up to {args.limit} of them with {len(agents)} agent(s)\n")
 
     screened = entered = 0
@@ -58,7 +72,7 @@ def main() -> None:
         token = Erc20(rpc, launch.token)
         symbol = token.symbol() or launch.token[:10]
         quote = (Erc20(rpc, launch.quote).symbol() if int(launch.quote, 16) else "native") or "?"
-        age = (head - launch.block) * BLOCK_SECONDS / 60
+        age = (head - launch.block) * secs_per_block / 60
 
         print(f"{symbol:<14} {phase:<10} vol {market.quote_volume:>10,.2f} {quote:<7}"
               f" dip {market.dip_from_high_pct:5.1f}%  {market.trades} trades")
