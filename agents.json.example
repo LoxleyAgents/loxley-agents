@@ -1,0 +1,12 @@
+{
+  "_comment": [
+    "Copy to agents.json to move any threshold without editing the code.",
+    "min_volume is denominated in the pool's quote asset, and pools quote in",
+    "native, GOOGL, NVDA, SGOV and others — those are not the same unit, so a",
+    "floor only means something against tokens sharing a quote.",
+    "What counts as thin also changes with the market: a floor that is",
+    "selective on a busy day refuses everything on a quiet one."
+  ],
+  "sheriff": { "min_volume": 40 },
+  "scarlet": { "min_volume": 5, "dip": 8 }
+}
