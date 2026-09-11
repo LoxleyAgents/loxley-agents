@@ -18,7 +18,7 @@ Standard library only. No install step, no API key, no indexer, no explorer.
    pool manager once it has graduated — and computes volume, price, and how far
    the last print sits below the window's high.
 3. Runs six sets of thresholds over that and returns either an entry or one of
-   six refusals.
+   five refusals.
 4. Records entries in `book.json` and closes them on take-profit, stop-loss or
    max hold.
 
@@ -33,11 +33,11 @@ Standard library only. No install step, no API key, no indexer, no explorer.
 | Little John | 400 | 22% | 40% | 18% | 720m |
 | Will Scarlet | 80 | 15% | 35% | 12% | 30m |
 
-A refusal is only ever one of these six, and every one is a statement about our
+A refusal is only ever one of these five, and every one is a statement about our
 own thresholds:
 
-`below volume floor` · `outside mcap range` · `dip not deep enough` ·
-`listed too long ago` · `already in position` · `daily cap reached`
+`below volume floor` · `dip not deep enough` · `listed too long ago` ·
+`already in position` · `daily cap reached`
 
 None of them is a claim about a token, its deployer, or anyone's intent. This
 code reads public swap logs, which cannot tell you those things.

@@ -17,15 +17,17 @@ from pathlib import Path
 
 from .market import Market
 
-# The six refusals, verbatim. Nothing else may be returned as a reason.
+# The five refusals, verbatim. Nothing else may be returned as a reason.
+# A sixth, "outside mcap range", was published for a while and removed: no
+# branch here could ever return it, and advertising a reason the code cannot
+# produce is worse than having one fewer.
 BELOW_VOLUME = "below volume floor"
-OUTSIDE_MCAP = "outside mcap range"
 SHALLOW_DIP = "dip not deep enough"
 TOO_OLD = "listed too long ago"
 IN_POSITION = "already in position"
 CAP_REACHED = "daily cap reached"
 
-REASONS = [BELOW_VOLUME, OUTSIDE_MCAP, SHALLOW_DIP, TOO_OLD, IN_POSITION, CAP_REACHED]
+REASONS = [BELOW_VOLUME, SHALLOW_DIP, TOO_OLD, IN_POSITION, CAP_REACHED]
 
 
 @dataclass(frozen=True)
