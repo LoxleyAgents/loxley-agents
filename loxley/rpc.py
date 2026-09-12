@@ -63,7 +63,9 @@ class Rpc:
                 last = exc
                 if attempt == retries:
                     raise RuntimeError(f"{method} failed: {exc}") from exc
-                time.sleep(1.5 * (attempt + 1))
+                # a rate limit needs real time, not a polite pause
+                rate_limited = getattr(exc, "code", None) == 429
+                time.sleep((6.0 if rate_limited else 1.5) * (attempt + 1))
         else:  # pragma: no cover - loop always breaks or raises
             raise RuntimeError(f"{method} failed: {last}")
 

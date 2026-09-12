@@ -65,6 +65,12 @@ Read this part before you read anything else.
   price feed here to convert between them.
 - **Any performance figure shown on our website is a simulation** and is not
   produced by this code.
+- **Volume is under-reported on busy tokens.** A token is tied to its pool by
+  correlating swaps with transfers, and that correlation runs on a narrow window
+  near the head — a pool that was busy early and has gone quiet is missed, and a
+  trade routed through several pools is only counted where it touches this one.
+  Measured against a token whose fees are published on-chain, this reads about
+  60% of the real quote volume. It is a floor, not a figure to quote.
 - **`--blocks` is a window, not history.** Volume and dip are measured over
   that window only, and a node will refuse a range that matches too many logs.
 

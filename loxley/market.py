@@ -151,48 +151,104 @@ def resolve_pool(rpc: Rpc, token: str, blocks: int = 300,
     return pool_id, token_is_0
 
 
-def market_stats(rpc: Rpc, token: str, quote: str | None = None,
-                 blocks: int = 300, head: int | None = None) -> Market | None:
-    """Volume and price for a token over a window, straight from swap logs.
+def resolve_pools(rpc: Rpc, token: str, blocks: int = 300,
+                  head: int | None = None, min_hits: int = 3
+                  ) -> list[tuple[str, bool]]:
+    """Every v4 pool this token trades in, busiest first.
 
-    Price is the ratio of the two amounts in each swap rather than anything
-    derived from sqrtPriceX96, so it needs no assumption about tick maths.
+    One token can have several pools — on a chain where the quote asset is a
+    choice, the same token may be quoted against more than one currency. Taking
+    only the busiest pool undercounts both volume and the latest price.
     """
     head = head or rpc.block_number()
     lo = head - blocks
 
-    found = resolve_pool(rpc, token, blocks, head)
-    if not found:
+    transfers = rpc.logs_chunked(token, lo, head, topics=[TRANSFER])
+    if not transfers:
+        return []
+    moved: dict[str, list[int]] = collections.defaultdict(list)
+    for t in transfers:
+        moved[t["transactionHash"]].append(decode_uint(t["data"]))
+
+    tally: collections.Counter = collections.Counter()
+    for s in rpc.logs_chunked(POOL_MANAGER, lo, head, topics=[V4_SWAP]):
+        amounts = moved.get(s["transactionHash"])
+        if not amounts:
+            continue
+        w = words(s["data"])
+        a0, a1 = abs(sint(w[0])), abs(sint(w[1]))
+        if _matches(a0, amounts):
+            tally[(s["topics"][1], True)] += 1
+        elif _matches(a1, amounts):
+            tally[(s["topics"][1], False)] += 1
+
+    # One pool must not appear twice with opposite sides: a single coincidental
+    # match would otherwise be trusted as much as hundreds of real ones, and the
+    # wrong side reads the token amount as the quote, inflating volume wildly.
+    best: dict[str, tuple[bool, int]] = {}
+    for (pool_id, token_is_0), hits in tally.items():
+        if pool_id not in best or hits > best[pool_id][1]:
+            best[pool_id] = (token_is_0, hits)
+
+    # and a pool needs more than a single chance match to be believed
+    keep = [(pid, side) for pid, (side, hits) in best.items() if hits >= min_hits]
+    keep.sort(key=lambda k: -best[k[0]][1])
+    return keep
+
+
+def market_stats(rpc: Rpc, token: str, quote: str | None = None,
+                 blocks: int = 300, head: int | None = None,
+                 resolve_blocks: int = 300) -> Market | None:
+    """Volume and price for a token over a window, straight from swap logs.
+
+    Price is the ratio of the two amounts in each swap rather than anything
+    derived from sqrtPriceX96, so it needs no assumption about tick maths.
+
+    Two windows, on purpose. Identifying the pool means correlating swaps with
+    transfers, which cannot be filtered server-side, so that runs over a narrow
+    `resolve_blocks`. Once the poolId is known it goes into the topic filter and
+    the node returns only this pool's swaps, which makes a wide `blocks` cheap.
+    Filtering those in Python instead pulls every swap on the chain: the pool
+    manager is the busiest contract on it.
+    """
+    head = head or rpc.block_number()
+    lo = head - blocks
+
+    # Pool discovery is a correlation scan and cannot be filtered server-side,
+    # so it runs on one narrow window near the head. A pool that was busy early
+    # and has since gone quiet will be missed — see the note in the README.
+    pools = resolve_pools(rpc, token, min(resolve_blocks, blocks), head)
+    if not pools:
         return None
-    pool_id, token_is_0 = found
 
     token_dec = Erc20(rpc, token).decimals() or 18
     quote_dec = Erc20(rpc, quote).decimals() if quote and int(quote, 16) else 18
 
-    prices: list[float] = []
-    volume = 0.0
-    buys = sells = 0
-    for s in rpc.logs_chunked(POOL_MANAGER, lo, head, topics=[V4_SWAP]):
-        if s["topics"][1] != pool_id:
-            continue
-        w = words(s["data"])
-        a0, a1 = sint(w[0]), sint(w[1])
-        raw_token, raw_quote = (a0, a1) if token_is_0 else (a1, a0)
-        if raw_token == 0 or raw_quote == 0:
-            continue
+    fills: list[tuple[int, int, float, float, bool]] = []
+    # poolId is indexed, so the node does the filtering, one pool at a time
+    for pool_id, token_is_0 in pools:
+        for s in rpc.logs_chunked(POOL_MANAGER, lo, head,
+                                  topics=[V4_SWAP, pool_id], span=20000):
+            w = words(s["data"])
+            a0, a1 = sint(w[0]), sint(w[1])
+            raw_token, raw_quote = (a0, a1) if token_is_0 else (a1, a0)
+            if raw_token == 0 or raw_quote == 0:
+                continue
+            token_amt = raw_token / 10 ** token_dec
+            quote_amt = raw_quote / 10 ** (quote_dec or 18)
+            fills.append((int(s["blockNumber"], 16), int(s["logIndex"], 16),
+                          abs(quote_amt) / abs(token_amt), abs(quote_amt),
+                          raw_token < 0))
 
-        token_amt = raw_token / 10 ** token_dec
-        quote_amt = raw_quote / 10 ** (quote_dec or 18)
-        prices.append(abs(quote_amt) / abs(token_amt))
-        volume += abs(quote_amt)
-        # negative means the token left the pool: someone bought it
-        if raw_token < 0:
-            buys += 1
-        else:
-            sells += 1
-
-    if not prices:
+    if not fills:
         return None
+
+    # pools are read one after another, so put every fill back in chain order
+    fills.sort(key=lambda f: (f[0], f[1]))
+    prices = [f[2] for f in fills]
+    volume = sum(f[3] for f in fills)
+    buys = sum(1 for f in fills if f[4])
+    sells = len(fills) - buys
 
     return Market(
         token=token,
@@ -232,15 +288,23 @@ SNIPE_TAX_CHARGED = "0x3bc39a5562b28f5fe8f36cecabfbaa12bb969acf05717994709225fc4
 
 
 def curve_stats(rpc: Rpc, token: str, pool: str, quote: str | None = None,
-                blocks: int = 3000, head: int | None = None) -> Market | None:
-    """Volume and price for a token still trading on its bonding curve."""
+                blocks: int = 3000, head: int | None = None,
+                from_block: int | None = None, to_block: int | None = None
+                ) -> Market | None:
+    """Volume and price for a token still trading on its bonding curve.
+
+    Pass `from_block`/`to_block` to read only the span the curve actually
+    existed for. Without them the scan runs the whole `blocks` window, which
+    for a token that graduated in seconds means thousands of pointless queries.
+    """
     head = head or rpc.block_number()
-    lo = head - blocks
+    lo = from_block if from_block is not None else head - blocks
+    hi = to_block if to_block is not None else head
 
     token_dec = Erc20(rpc, token).decimals() or 18
     quote_dec = (Erc20(rpc, quote).decimals() or 18) if quote and int(quote, 16) else 18
 
-    events = rpc.logs_chunked(pool, lo, head, topics=[[CURVE_BUY, CURVE_SELL]])
+    events = rpc.logs_chunked(pool, lo, hi, topics=[[CURVE_BUY, CURVE_SELL]])
     events.sort(key=lambda e: (int(e["blockNumber"], 16), int(e["logIndex"], 16)))
 
     prices: list[float] = []
@@ -282,23 +346,60 @@ def curve_stats(rpc: Rpc, token: str, pool: str, quote: str | None = None,
 
 
 def stats_for(rpc: Rpc, launch: Launch, blocks: int = 3000,
-              head: int | None = None) -> tuple[Market | None, str]:
-    """Read a token whichever phase it is in.
+              head: int | None = None, v4_blocks: int | None = None
+              ) -> tuple[Market | None, str]:
+    """Read a token across both phases and add them together.
 
-    Returns (market, phase) where phase is "curve", "graduated" or "quiet".
-    A token that has graduated stops emitting curve events, and one that has
-    not yet graduated never appears in the v4 manager, so the two windows do
-    not overlap and there is nothing to merge.
+    A token trades on its bonding curve, graduates, and then trades in the
+    Uniswap v4 pool. Both windows can hold real volume for the same token, so
+    reading only the first one that answers under-reports badly: PAIREX
+    graduated 253 blocks — about 26 seconds — after launch, which left 11,063
+    USDG on the curve against roughly six million traded afterwards.
+
+    Returns (market, phase) where phase is "curve", "graduated",
+    "curve+graduated" or "quiet".
+
+    The v4 pool manager is the busiest contract on the chain, so its window is
+    separate: widen `v4_blocks` deliberately rather than by accident.
     """
     head = head or rpc.block_number()
+    if v4_blocks is None:
+        v4_blocks = blocks
 
-    on_curve = curve_stats(rpc, launch.token, launch.pool, launch.quote, blocks, head)
+    # each phase is read only over the span it existed for
+    grad = graduated_at(rpc, launch.token, head)
+    on_curve = curve_stats(rpc, launch.token, launch.pool, launch.quote,
+                           blocks, head,
+                           from_block=launch.block,
+                           to_block=grad if grad else head)
+    v4_from = grad if grad else head - v4_blocks
+    on_v4 = market_stats(rpc, launch.token, launch.quote,
+                         blocks=max(1, head - v4_from), head=head)
+
+    if on_curve and on_v4:
+        return Market(
+            token=launch.token,
+            trades=on_curve.trades + on_v4.trades,
+            buys=on_curve.buys + on_v4.buys,
+            sells=on_curve.sells + on_v4.sells,
+            quote_volume=on_curve.quote_volume + on_v4.quote_volume,
+            # the curve runs first, the pool last
+            first_price=on_curve.first_price,
+            last_price=on_v4.last_price,
+            high=max(on_curve.high, on_v4.high),
+            low=min(on_curve.low, on_v4.low),
+        ), "curve+graduated"
+
     if on_curve:
         return on_curve, "curve"
-
-    # v4 is far busier, so it is read over a shorter window
-    on_v4 = market_stats(rpc, launch.token, launch.quote, min(blocks, 300), head)
     if on_v4:
         return on_v4, "graduated"
-
     return None, "quiet"
+
+
+def graduated_at(rpc: Rpc, token: str, head: int | None = None) -> int | None:
+    """Block at which the token left its curve, or None if it never did."""
+    head = head or rpc.block_number()
+    pad = "0x" + token[2:].lower().rjust(64, "0")
+    logs = rpc.logs(FACTORY, 0, head, topics=[POOL_GRADUATED, pad])
+    return int(logs[0]["blockNumber"], 16) if logs else None
